@@ -9,15 +9,27 @@ class EventMail(models.Model):
     _inherit = "event.mail"
 
     interval_type = fields.Selection(
-        selection_add=[("after_cancel", "After the event cancellation")],
-        ondelete={"after_cancel": "cascade"},
+        selection_add=[
+            ("after_cancel", "After the event cancellation"),
+            ("after_registration_cancel", "After a registration cancellation"),
+        ],
+        ondelete={
+            "after_cancel": "cascade",
+            "after_registration_cancel": "cascade",
+        },
     )
 
     @api.depends("event_id.stage_id")
     def _compute_scheduled_date(self):
-        """When we cancel the event, we set the scheduled mail"""
-        regular_schedulers = self.filtered(lambda x: x.interval_type != "after_cancel")
+        """When we cancel the event or registration, we set the scheduled mail"""
+        # Filter out after_cancel and after_registration_cancel from regular schedulers
+        regular_schedulers = self.filtered(
+            lambda x: x.interval_type
+            not in ("after_cancel", "after_registration_cancel")
+        )
         res = super(EventMail, regular_schedulers)._compute_scheduled_date()
+
+        # Handle after_cancel (event cancellation)
         for scheduler in self.filtered(
             lambda x: x.interval_type == "after_cancel"
             and x.event_id.stage_id.is_cancelled
@@ -29,11 +41,23 @@ class EventMail(models.Model):
                 if date
                 else False
             )
+
+        # Handle after_registration_cancel (individual registration cancellation)
+        # This is computed dynamically when executing based on individual registrations
+        for scheduler in self.filtered(
+            lambda x: x.interval_type == "after_registration_cancel"
+        ):
+            # Set a default date; actual scheduling is determined per registration
+            scheduler.scheduled_date = fields.Datetime.now()
+
         return res
 
     @api.depends("interval_type", "mail_done", "scheduled_date")
     def _compute_mail_state(self):
-        todo = self.filtered(lambda x: x.interval_type == "after_cancel")
+        # Handle after_cancel and after_registration_cancel
+        todo = self.filtered(
+            lambda x: x.interval_type in ("after_cancel", "after_registration_cancel")
+        )
         for scheduler in todo:
             if scheduler.mail_done:
                 scheduler.mail_state = "sent"
@@ -45,8 +69,14 @@ class EventMail(models.Model):
 
     def execute(self):
         """Plan the mailings"""
-        regular_schedulers = self.filtered(lambda x: x.interval_type != "after_cancel")
+        # Filter out after_cancel and after_registration_cancel from regular schedulers
+        regular_schedulers = self.filtered(
+            lambda x: x.interval_type
+            not in ("after_cancel", "after_registration_cancel")
+        )
         res = super(EventMail, regular_schedulers).execute()
+
+        # Handle after_cancel (event cancellation)
         for scheduler in self.filtered(
             lambda x: x.interval_type == "after_cancel"
             and x.event_id.stage_id.is_cancelled
@@ -67,6 +97,32 @@ class EventMail(models.Model):
                     "mail_count_done": total_sent,
                 }
             )
+
+        # Handle after_registration_cancel (individual registration cancellation)
+        for scheduler in self.filtered(
+            lambda x: x.interval_type == "after_registration_cancel"
+        ):
+            # Get registrations that are cancelled but haven't been processed yet
+            registrations = (
+                scheduler.event_id.registration_ids.filtered(
+                    lambda r: r.state == "cancel"
+                )
+                - scheduler.mail_registration_ids.registration_id
+            )
+            if registrations:
+                scheduler._create_missing_mail_registrations(registrations)
+                scheduler.mail_registration_ids.execute()
+            total_sent = len(
+                scheduler.mail_registration_ids.filtered(lambda reg: reg.mail_sent)
+            )
+            total_registrations = len(scheduler.mail_registration_ids.registration_id)
+            scheduler.update(
+                {
+                    "mail_done": total_sent >= total_registrations,
+                    "mail_count_done": total_sent,
+                }
+            )
+
         return res
 
 
@@ -77,17 +133,33 @@ class EventMailRegistration(models.Model):
         """We don't have a very good hooks. This is almost rewritten from the original
         just allows to send the mailing to the cancelled registrations"""
         now = fields.Datetime.now()
+
+        # Filter regular schedulers
         regular = self.filtered(
-            lambda x: x.scheduler_id.interval_type != "after_cancel"
+            lambda x: x.scheduler_id.interval_type
+            not in ("after_cancel", "after_registration_cancel")
         )
         res = super(EventMailRegistration, regular).execute()
-        todo = self.filtered(
+
+        # Handle after_cancel (event cancellation)
+        after_cancel_todo = self.filtered(
             lambda x: x.scheduler_id.interval_type == "after_cancel"
             and not x.mail_sent
             and not x.registration_id.state == "draft"
             and (x.scheduled_date and x.scheduled_date <= now)
             and x.scheduler_id.notification_type == "mail"
         )
+
+        # Handle after_registration_cancel (individual registration cancellation)
+        after_reg_cancel_todo = self.filtered(
+            lambda x: x.scheduler_id.interval_type == "after_registration_cancel"
+            and not x.mail_sent
+            and x.registration_id.state == "cancel"
+            and x.scheduler_id.notification_type == "mail"
+        )
+
+        todo = after_cancel_todo | after_reg_cancel_todo
+
         for reg_mail in todo:
             organizer = reg_mail.scheduler_id.event_id.organizer_id
             company = self.env.company
@@ -105,5 +177,6 @@ class EventMailRegistration(models.Model):
             if not template.email_from:
                 email_values["email_from"] = author.email_formatted
             template.send_mail(reg_mail.registration_id.id, email_values=email_values)
+
         todo.write({"mail_sent": True})
         return res
